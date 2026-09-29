@@ -16,6 +16,7 @@ BUNDLE_VERSION="7"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 ICON_SVG="Resources/claude-logo.svg"
 ICON_ICNS="Resources/AppIcon.icns"
+SOUND_FILES=(huh-1 huh-2 huh-3 last)
 
 echo "Building..."
 swift build -c release
@@ -34,6 +35,9 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$BUILD_DIR/claude-notify" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$ICON_ICNS" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+for snd in "${SOUND_FILES[@]}"; do
+    cp "Resources/$snd.mp3" "$APP_BUNDLE/Contents/Resources/"
+done
 
 cat > "$APP_BUNDLE/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>

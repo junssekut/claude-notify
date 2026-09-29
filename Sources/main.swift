@@ -4,6 +4,28 @@ import UserNotifications
 let NOTIF_NAME = Notification.Name("com.claude.notify.send")
 let BUNDLE_ID = "com.junskii.claudenotify"
 
+let GLASS_SOUND = "/System/Library/Sounds/Glass.aiff"
+
+/// The Minecraft clips, bundled under Contents/Resources and played in rotation:
+/// one per notification, wrapping back to the first after the last. Empty when
+/// Bundle.main has no resources to resolve, e.g. the bare binary outside an .app.
+let MINECRAFT_SOUNDS: [String] = ["huh-1", "huh-2", "huh-3", "last"].compactMap {
+    Bundle.main.url(forResource: $0, withExtension: "mp3")?.path
+}
+
+/// Sound options offered in the menu bar.
+enum SoundScheme: String, CaseIterable {
+    case minecraft
+    case glass
+
+    var title: String {
+        switch self {
+        case .minecraft: return "Minecraft (rotating)"
+        case .glass: return "Glass"
+        }
+    }
+}
+
 /// Lock lives under Application Support, not /tmp. macOS reaps stale /tmp files,
 /// and a missing lock file silently breaks single-instance detection: fcntl locks
 /// are held on the inode, so once the path is gone a client recreates it, acquires
@@ -116,9 +138,57 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
 
         menu.addItem(NSMenuItem.separator())
+
+        let soundMenu = NSMenu()
+        for scheme in SoundScheme.allCases {
+            let item = NSMenuItem(title: scheme.title, action: #selector(selectSound(_:)), keyEquivalent: "")
+            item.representedObject = scheme.rawValue
+            item.state = scheme == soundScheme ? .on : .off
+            item.target = self
+            soundMenu.addItem(item)
+        }
+        let soundItem = NSMenuItem(title: "Sound", action: nil, keyEquivalent: "")
+        soundItem.submenu = soundMenu
+        menu.addItem(soundItem)
+
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
 
         statusItem.menu = menu
+    }
+
+    // Selection and rotation cursor both live in UserDefaults, so the choice and
+    // the position in the rotation survive a daemon restart or a machine reboot.
+    var soundScheme: SoundScheme {
+        get {
+            guard let raw = UserDefaults.standard.string(forKey: "soundScheme"),
+                  let scheme = SoundScheme(rawValue: raw) else { return .minecraft }
+            return scheme
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "soundScheme") }
+    }
+
+    var soundIndex: Int {
+        get { UserDefaults.standard.integer(forKey: "soundIndex") }
+        set { UserDefaults.standard.set(newValue, forKey: "soundIndex") }
+    }
+
+    /// Path for this notification, advancing the rotation under the Minecraft
+    /// scheme. Falls back to Glass when the bundled clips cannot be resolved.
+    func nextSoundPath() -> String {
+        guard soundScheme == .minecraft, !MINECRAFT_SOUNDS.isEmpty else { return GLASS_SOUND }
+        let path = MINECRAFT_SOUNDS[soundIndex % MINECRAFT_SOUNDS.count]
+        soundIndex = (soundIndex + 1) % MINECRAFT_SOUNDS.count
+        return path
+    }
+
+    /// afplay in a detached process: UNNotificationSound is unreliable here, and
+    /// this also lets the menu preview a choice without posting a notification.
+    func playSound(path: String) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+        task.arguments = [path]
+        try? task.run()
     }
 
     func updateBadge() {
@@ -135,6 +205,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         history.removeAll { $0.id == notif.id }
         updateBadge()
+    }
+
+    @objc func selectSound(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let scheme = SoundScheme(rawValue: raw) else { return }
+        soundScheme = scheme
+        soundIndex = 0
+        updateMenu()
+        // Play the pick so the choice is audible without waiting for a notification.
+        playSound(path: scheme == .minecraft ? (MINECRAFT_SOUNDS.first ?? GLASS_SOUND) : GLASS_SOUND)
     }
 
     @objc func clearAll() {
@@ -182,7 +262,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let content = UNMutableNotificationContent()
         content.title = args.title
         content.body = args.message
-        content.sound = args.sound ? .default : nil
+        // Sound is played by afplay below, not by Notification Center. Setting this
+        // would stack the system default on top of the custom file: two sounds.
+        content.sound = nil
         content.userInfo = ["bundleId": args.activate ?? ""]
 
         let id = UUID().uuidString
@@ -199,10 +281,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Play sound directly (UNNotificationSound.default doesn't always work)
         if args.sound {
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-            task.arguments = ["/System/Library/Sounds/Glass.aiff"]
-            try? task.run()
+            playSound(path: nextSoundPath())
         }
     }
 
