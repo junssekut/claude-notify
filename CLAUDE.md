@@ -5,12 +5,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-# Build and create app bundle
+# Build app bundle (also generates the icon and ad-hoc signs it)
 ./build.sh
 
-# Install to /Applications
+# Install to /Applications (remove first: cp -r into an existing .app merges)
+rm -rf /Applications/ClaudeNotify.app
 cp -r .build/release/ClaudeNotify.app /Applications/
-codesign --force --deep --sign - /Applications/ClaudeNotify.app
 
 # Load LaunchAgent (auto-start)
 launchctl load ~/Library/LaunchAgents/com.claude.notify.plist
