@@ -2,8 +2,19 @@ import Cocoa
 import UserNotifications
 
 let NOTIF_NAME = Notification.Name("com.claude.notify.send")
-let BUNDLE_ID = "com.claude.notify"
-let LOCK_FILE = "/tmp/claude-notify.lock"
+let BUNDLE_ID = "com.junskii.claudenotify"
+
+/// Lock lives under Application Support, not /tmp. macOS reaps stale /tmp files,
+/// and a missing lock file silently breaks single-instance detection: fcntl locks
+/// are held on the inode, so once the path is gone a client recreates it, acquires
+/// the lock on a fresh inode, and wrongly concludes no daemon is running.
+let LOCK_FILE: String = {
+    let dir = FileManager.default
+        .homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/ClaudeNotify", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("daemon.lock").path
+}()
 
 // Single instance lock using file lock
 class SingleInstance {
@@ -33,11 +44,18 @@ class SingleInstance {
         return true
     }
 
-    deinit {
+    // Closing the descriptor releases the fcntl lock. The file itself is left in
+    // place deliberately: unlinking it lets a later client recreate the path as a
+    // new inode and take the lock while this daemon still holds the old one.
+    func unlock() {
         if fileDescriptor != -1 {
             close(fileDescriptor)
-            unlink(LOCK_FILE)
+            fileDescriptor = -1
         }
+    }
+
+    deinit {
+        unlock()
     }
 }
 
@@ -248,27 +266,62 @@ func sendToDaemon(args: NotificationArgs) {
     )
 }
 
+/// Start the daemon through Launch Services, forwarding this invocation's
+/// arguments so the new instance posts the notification itself. Returns false
+/// when there is no .app bundle to launch, e.g. running the bare binary.
+func relaunchAsDaemon(args: NotificationArgs) -> Bool {
+    let bundleURL = Bundle.main.bundleURL
+    guard Bundle.main.bundleIdentifier != nil, bundleURL.pathExtension == "app" else {
+        return false
+    }
+
+    var forwarded = ["--daemon", "-t", args.title, "-m", args.message]
+    if let activate = args.activate, !activate.isEmpty {
+        forwarded += ["-a", activate]
+    }
+    if !args.sound {
+        forwarded.append("--no-sound")
+    }
+
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    task.arguments = ["-a", bundleURL.path, "--args"] + forwarded
+    do {
+        try task.run()
+    } catch {
+        return false
+    }
+    task.waitUntilExit()
+    return task.terminationStatus == 0
+}
+
 // Parse arguments
 var notifArgs = NotificationArgs()
 var daemonMode = false
 
-var args = CommandLine.arguments.dropFirst()
-while let arg = args.first {
-    args = args.dropFirst()
+// Launch Services may append -psn_… when opening an app bundle; ignore it.
+var args: [String] = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-psn_") }
+
+// A bare launch passes no arguments (`open ClaudeNotify.app`), which is the
+// documented way to start the daemon. Without this the parser falls through to
+// the usage error below and exits 1.
+if args.isEmpty {
+    daemonMode = true
+}
+
+while !args.isEmpty {
+    let arg = args.removeFirst()
     switch arg {
     case "-d", "--daemon":
         daemonMode = true
     case "-t", "--title":
-        notifArgs.title = args.first ?? notifArgs.title
-        args = args.dropFirst()
+        if !args.isEmpty { notifArgs.title = args.removeFirst() }
     case "-m", "--message":
-        notifArgs.message = args.first ?? ""
-        args = args.dropFirst()
+        if !args.isEmpty { notifArgs.message = args.removeFirst() }
     case "--no-sound":
         notifArgs.sound = false
     case "-a", "--activate":
-        notifArgs.activate = args.first
-        args = args.dropFirst()
+        if !args.isEmpty { notifArgs.activate = args.removeFirst() }
     case "-h", "--help":
         print("""
         Usage:
@@ -302,13 +355,26 @@ if daemonMode || !notifArgs.message.isEmpty {
         exit(0)
     }
 
+    // No daemon is running. A client must not promote itself: a binary exec'd
+    // directly carries no Launch Services identity, and macOS needs that to
+    // resolve the app icon shown on the notification. Hand off to a daemon
+    // started through Launch Services instead.
+    if !daemonMode {
+        singleInstance.unlock()
+        if relaunchAsDaemon(args: notifArgs) {
+            exit(0)
+        }
+        // No .app bundle to launch (bare binary): serve the notification here.
+        _ = singleInstance.tryLock()
+    }
+
     // Start as menu bar app
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     let delegate = AppDelegate()
     app.delegate = delegate
 
-    if !daemonMode && !notifArgs.message.isEmpty {
+    if !notifArgs.message.isEmpty {
         // Send notification after app starts
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             delegate.sendNotification(args: notifArgs)
